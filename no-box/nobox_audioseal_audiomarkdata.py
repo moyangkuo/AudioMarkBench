@@ -4,6 +4,7 @@ import argparse
 import numpy as np
 import torch
 import torchaudio 
+from audioseal import AudioSeal
 from tqdm import tqdm
 from torch.nn import functional as F
 
@@ -27,7 +28,7 @@ warnings.filterwarnings(
 
 def parse_arguments():
     parser = argparse.ArgumentParser(description="Audio Watermarking with WavMark")
-    parser.add_argument("--testset_size", type=int, default=20000, help="Number of samples from the test set to process")
+    parser.add_argument("--testset_size", type=int, default=100, help="Number of samples from the test set to process")
     parser.add_argument("--encode", action="store_true", help="Run the encoding process before decoding")
     parser.add_argument("--common_perturbation", type=str, default="") 
     '''
@@ -41,11 +42,9 @@ def parse_arguments():
     parser.add_argument("--batch_size", type=int, default=100, help="Maximum length of audio samples to process (in time samples)")
     return parser.parse_args()
 
-def encode_audio_files(model,data_dir, output_dir, max_length):
-    detector = model[1] # detector
-    model = model[0] # generator
-    
+def encode_audio_files(model, data_dir, output_dir, max_length):
     total_ba = []
+    total_probs = []
     total_counts = 0
     
     file_list = [file for file in os.listdir(data_dir) if file.endswith('.mp3')]
@@ -68,42 +67,65 @@ def encode_audio_files(model,data_dir, output_dir, max_length):
 
         signal = waveform.unsqueeze(0).to(device=next(model.parameters()).device)
 
-        msg = torch.randint(0, 2, (signal.shape[0], 30), device=signal.device,dtype=torch.float32)
-        '''rescale the message to -1 and 1 according to the watermark function'''
-        msg = msg.unsqueeze(0)  
-        msg_rescaled = msg * 2 - 1
-        '''watermark function call'''
-        watermarked_signal = model.test_forward(signal, msg_rescaled)[0]
+        msg = torch.randint(0, 2, (signal.shape[0], model.msg_processor.nbits), dtype=torch.int64, device=signal.device)
+        watermark = model.get_watermark(signal, message=msg)
+        watermarked_signal = signal + watermark
 
         # Compute SNR
         signal_power = torch.mean(signal ** 2)
         noise_power = torch.mean((watermarked_signal - signal) ** 2)
         snr = 10 * torch.log10(signal_power / noise_power)
         
-        msg_str =  ''.join([''.join(map(str, map(int, msg.squeeze().tolist())))])
+        msg_str =  ''.join([''.join(map(str, msg[0].tolist()))])
         file_name = f"{file[:-4]}_{msg_str}_{snr:.3f}.wav"
         watermarked_signal = watermarked_signal.cpu().squeeze(0)
         save_path = os.path.join(output_dir, 'watermarked')
         os.makedirs(save_path, exist_ok=True)
         torchaudio.save(os.path.join(save_path, file_name), watermarked_signal, sample_rate)
-
-        bit_acc = get_bitacc(detector, signal, msg)
-        total_ba.append(bit_acc.item()) 
+        
+        detector = AudioSeal.load_detector("audioseal_detector_16bits").to(device=next(model.parameters()).device)
+        detector.eval()
+        # Compute FPR
+        with torch.no_grad():
+            result, msg_decoded = detector.detect_watermark(signal)
+            detect_prob = get_detection_probability(detector, signal)
+        
+        corrrect = (msg == msg_decoded).sum().item()
+        msg_len = 16 #16 bits
+        total_ba.append(corrrect/msg_len)
+        total_probs.extend(detect_prob)
         total_counts += 1
 
     return
+
+
+def get_detection_probability(detector, x):
+    detector.eval()  # Set the detector to evaluation mode
+    with torch.no_grad():  # Disable gradient calculation
+        # Ensure 'x' is in the expected shape (B, C, T)
+        if x.ndim != 3:
+            raise ValueError(f"Input tensor 'x' must have 3 dimensions, got {x.ndim}")
+
+        result, _ = detector(x)  # Get the detector's output
+
+        # Calculate detection probability for each example in the batch
+        detect_probs = torch.gt(result[:, 1, :], 0.5).float()  # Convert boolean to float (True to 1.0, False to 0.0)
+        detect_probs = detect_probs.mean(dim=1)  # Average over the last dimension if applicable
+        detect_probs = detect_probs.cpu().tolist()  # Convert to list and move to CPU
+
+        return detect_probs
+
+
+def detection_probs(detect_prob, tau=0.2):
+    detection_results = [1 if prob > tau else 0 for prob in detect_prob]
+    fraction_of_ones = sum(detection_results) / len(detection_results)
+    return fraction_of_ones
 
 def detection_BA(detect_BA, tau=0.8):
     detection_results = [1 if BA > tau else 0 for BA in detect_BA]
     fraction_of_ones = sum(detection_results) / len(detection_results)
     return fraction_of_ones
 
-def get_bitacc(model, signal, message):
-    with torch.no_grad():
-        msg_decoded = model.test_forward(signal).squeeze()
-        message = message * 2 - 1
-        msg_decoded = msg_decoded.to(message.device)
-    return (msg_decoded >= 0).eq(message >= 0).sum(dim=-1).float()/ message.shape[-1]
 
 def extract_id(filename):
     file_name = filename.split('/')[-1]
@@ -113,20 +135,24 @@ def extract_id(filename):
 
 def decode_audio_files(model, output_dir, batch_size):
     total_ba = []
+    total_probs = []
     total_counts = 0
     file_list = [file for file in os.listdir(output_dir) if file.endswith('.wav')]
     progress_bar = tqdm(enumerate(file_list), desc="Decoding Watermarks")
 
+    detector = AudioSeal.load_detector("audioseal_detector_16bits").to(device=next(model.parameters()).device)
+    detector.eval()
+
     batch_watermarked_signals = []
     original_msgs = []
     path_list = []
-    output_txt_dir = f'txt_audiomark_Timbre/test'
+    output_txt_dir = f'txt_audiomarkdata_AudioSeal/test'
     os.makedirs(output_txt_dir, exist_ok=True)
     output_file = os.path.join(output_txt_dir, "decoding_results_AudioSeal.txt")
 
-
     with open(output_file, 'w') as txt_file:
-        txt_file.write("Path, Timbre BA\n")
+        txt_file.write("Path, AudioSeal-B BA, AudioSeal Dection Ratio, SNR, Visqol score\n")
+
         for id, file in progress_bar:
             try:
                 index_str, payload_str = file.rstrip('.wav').split('_')[-3:-1]
@@ -144,27 +170,37 @@ def decode_audio_files(model, output_dir, batch_size):
             watermarked_signal = watermarked_signal.to(device=next(model.parameters()).device).unsqueeze(0)
             batch_watermarked_signals.append(watermarked_signal)
 
-            # Extract original payload from filename for BER calculation
             if len(batch_watermarked_signals) == batch_size or id == len(file_list) - 1:
                 batch_watermarked_signals = torch.cat(batch_watermarked_signals, dim=0)
                 original_msgs = torch.stack(original_msgs)
-                bw_acc = get_bitacc(model, batch_watermarked_signals, original_msgs)
+
+                with torch.no_grad():
+                    results, msgs_decoded = detector.detect_watermark(batch_watermarked_signals)
+                    detect_probs = get_detection_probability(detector, batch_watermarked_signals)
+
                 for i in range(len(batch_watermarked_signals)):
-                    total_ba.append(bw_acc[i].item())
+                    correct = (original_msgs[i] == msgs_decoded[i]).sum().item()
+                    msg_len = 16  # 16 bits
+                    BA = correct / msg_len
+                    detection_probability = detect_probs[i]
+                    total_ba.append(BA)
+                    total_probs.append(detection_probability)
                     total_counts += 1
-                    txt_file.write(f"{path_list[i]}, {bw_acc[i].item()}\n")
-                # Reset the batch
-                batch_watermarked_signals = []
-                original_msgs = []
-                path_list = []
+                    txt_file.write(f"{path_list[i]}, {BA:.2f}, {detection_probability:.2f}\n")
 
                 current_average_BA = (sum(total_ba) / total_counts) * 100
-                progress_bar.set_description(f"Decoding Watermarks - Avg BA: {current_average_BA:.2f}%")
+                current_average_dect_prob = (sum(total_probs) / total_counts) * 100
+                progress_bar.set_description(f"Decoding Watermarks - Avg BA: {current_average_BA:.2f}%, Avg Det: {current_average_dect_prob:.2f}")
 
                 # Reset the batch
                 batch_watermarked_signals = []
                 original_msgs = []
                 path_list = []
+
+        for tau_probs in [0.00, 0.01, 0.02, 0.05, 0.1, 0.15]:
+            detection_fraction = detection_probs(total_probs, tau_probs)
+            fnr = 1-detection_fraction
+            print(f'FNR (Tau_probs={tau_probs}): {fnr:.3f}\n')
 
         for tau_ba in [0.625, 0.6875, 0.75, 0.8125, 0.875, 0.9375]:
             detection_fraction = detection_BA(total_ba, tau_ba)
@@ -176,81 +212,19 @@ def decode_audio_files(model, output_dir, batch_size):
 
 
 def decode_audio_files_perturb(model, output_dir, common_perturbation, args):
-    if common_perturbation == '':
-        total_ba = []
-        total_visqol_scores = []
-        total_counts = 0
-        output_dir_pert = f'log_timbre_audiomark_max_5s/TPR'
-        os.makedirs(output_dir_pert, exist_ok=True)
-        file_list = [file for file in os.listdir(output_dir) if file.endswith('.wav')]
-        progress_bar = tqdm(enumerate(file_list), desc=f"Applying {common_perturbation}")
-        
-        batch_watermarked_signals = []
-        batch_visqol_scores = []
-        batch_SNRs = []
-        original_msgs = []
-        path_list = []
-        visqol = api_visqol()
-        output_txt_dir = f'txt_audiomark_Timbre/test'
-        os.makedirs(output_txt_dir, exist_ok=True)
-        output_file = os.path.join(output_txt_dir, f"watermarked_acc.txt")
-
-        with open(output_file, 'w') as txt_file:
-            txt_file.write("Path, Timbre BA, SNR, Visqol score\n")
-
-            for id, file in progress_bar:
-                try:
-                    index_str, payload_str = file.rstrip('.wav').split('_')[-3:-1]
-                    index = int(index_str)
-                except ValueError:
-                    continue
-
-                original_msg_np = np.array(list(map(int, payload_str)))
-                original_msg = torch.tensor(original_msg_np, dtype=torch.int32).to(device=next(model.parameters()).device)
-                original_msgs.append(original_msg)
-
-                path = os.path.join(output_dir, file)
-                path_list.append(extract_id(path))
-                waveform, sample_rate = torchaudio.load(path)
-
-                waveform_pert = waveform.unsqueeze(0).to(device=next(model.parameters()).device)
-                batch_watermarked_signals.append(waveform_pert)
-                
-                if args.save_pert:
-                    torchaudio.save(os.path.join(output_dir_pert, file), waveform_pert.squeeze(0).detach().cpu(), sample_rate)
-
-                # Extract original payload from filename for BER calculation
-                if len(batch_watermarked_signals) == args.batch_size or id == len(file_list) - 1:
-                    batch_watermarked_signals = torch.cat(batch_watermarked_signals, dim=0)
-                    original_msgs = torch.stack(original_msgs)
-                    bw_acc = get_bitacc(model, batch_watermarked_signals, original_msgs)
-                    for i in range(len(batch_watermarked_signals)):
-                        total_ba.append(bw_acc[i].item())
-                        total_visqol_scores.append(batch_visqol_scores[i])
-                        total_counts += 1
-                        txt_file.write(f"{path_list[i]}, {bw_acc[i].item()}, {batch_SNRs[i]:.2f}, {batch_visqol_scores[i]}\n")
-                    # Reset the batch
-                    batch_watermarked_signals = []
-                    batch_visqol_scores = []
-                    batch_SNRs = []
-                    original_msgs = []
-                    path_list = []
-
-                    current_average_BA = (sum(total_ba) / total_counts) * 100
-                    current_average_visqol = sum(total_visqol_scores) / total_counts
-                    progress_bar.set_description(f"Time Stretch w speed {speed_factor} Avg BA: {current_average_BA:.2f}% - Avg Visqol: {current_average_visqol:.2f}")
-
-            tau_ba = 0.83
-            detection_fraction = detection_BA(total_ba, tau_ba)
-            print(f'TPR for Timbre (Tau_ber={tau_ba}): {detection_fraction:.3f}\n')
-
+    detector = AudioSeal.load_detector("audioseal_detector_16bits").to(device=next(model.parameters()).device)
+    detector.eval()
+    
     if common_perturbation == "time_stretch":
         speed_factor_list = [0.7, 0.9, 1.1, 1.3, 1.5]
+
+
         for speed_factor in speed_factor_list:
             total_ba = []
+            total_probs = []
             total_visqol_scores = []
             total_counts = 0
-            output_dir_pert = f'log_timbre_audiomark_max_5s/common_pert_time_stretch_speed_{speed_factor}'
+            output_dir_pert = f'log_audioseal_audiomarkdata_max_5s/common_pert_time_stretch_speed_{speed_factor}'
             os.makedirs(output_dir_pert, exist_ok=True)
             file_list = [file for file in os.listdir(output_dir) if file.endswith('.wav')]
             progress_bar = tqdm(enumerate(file_list), desc=f"Applying {common_perturbation}")
@@ -261,13 +235,12 @@ def decode_audio_files_perturb(model, output_dir, common_perturbation, args):
             original_msgs = []
             path_list = []
             visqol = api_visqol()
-            output_txt_dir = f'txt_audiomark_Timbre/no_box_attack'
+            output_txt_dir = f'txt_audiomarkdata_AudioSeal/no_box_attack'
             os.makedirs(output_txt_dir, exist_ok=True)
             output_file = os.path.join(output_txt_dir, f"time_stretch_{speed_factor}.txt")
 
             with open(output_file, 'w') as txt_file:
-                txt_file.write("Path, Timbre BA, SNR, Visqol score\n")
-
+                txt_file.write("Path, AudioSeal-B BA, AudioSeal Dection Ratio, SNR, Visqol score\n")
                 for id, file in progress_bar:
                     try:
                         index_str, payload_str = file.rstrip('.wav').split('_')[-3:-1]
@@ -291,21 +264,35 @@ def decode_audio_files_perturb(model, output_dir, common_perturbation, args):
 
                     waveform_pert = waveform_pert.unsqueeze(0).to(device=next(model.parameters()).device)
                     batch_watermarked_signals.append(waveform_pert)
-                    
+
                     if args.save_pert:
                         torchaudio.save(os.path.join(output_dir_pert, file), waveform_pert.squeeze(0).detach().cpu(), new_sample_rate)
-
 
                     # Extract original payload from filename for BER calculation
                     if len(batch_watermarked_signals) == args.batch_size or id == len(file_list) - 1:
                         batch_watermarked_signals = torch.cat(batch_watermarked_signals, dim=0)
                         original_msgs = torch.stack(original_msgs)
-                        bw_acc = get_bitacc(model, batch_watermarked_signals, original_msgs)
+
+                        with torch.no_grad():
+                            results, msgs_decoded = detector.detect_watermark(batch_watermarked_signals)
+                            detect_probs = get_detection_probability(detector, batch_watermarked_signals)
+
                         for i in range(len(batch_watermarked_signals)):
-                            total_ba.append(bw_acc[i].item())
+                            correct = (original_msgs[i] == msgs_decoded[i]).sum().item()
+                            msg_len = 16  # 16 bits
+                            BA = correct / msg_len
+                            detection_probability = detect_probs[i]
+                            total_ba.append(BA)
+                            total_probs.append(detection_probability)
                             total_visqol_scores.append(batch_visqol_scores[i])
                             total_counts += 1
-                            txt_file.write(f"{path_list[i]}, {bw_acc[i].item()}, {batch_SNRs[i]:.2f}, {batch_visqol_scores[i]}\n")
+                            txt_file.write(f"{path_list[i]}, {BA:.2f}, {detection_probability:.2f}, {batch_SNRs[i]:.2f}, {batch_visqol_scores[i]}\n")
+
+                        current_average_BA = (sum(total_ba) / total_counts) * 100
+                        current_average_dect_prob = (sum(total_probs) / total_counts) * 100
+                        current_average_visqol = sum(total_visqol_scores) / total_counts
+                        progress_bar.set_description(f"Time Stretch w speed {speed_factor} - Avg BA: {current_average_BA:.2f}%, Avg Det: {current_average_dect_prob:.2f}, Avg Visqol: {current_average_visqol:.2f}")
+
                         # Reset the batch
                         batch_watermarked_signals = []
                         batch_visqol_scores = []
@@ -313,21 +300,22 @@ def decode_audio_files_perturb(model, output_dir, common_perturbation, args):
                         original_msgs = []
                         path_list = []
 
-                        current_average_BA = (sum(total_ba) / total_counts) * 100
-                        current_average_visqol = sum(total_visqol_scores) / total_counts
-                        progress_bar.set_description(f"Time Stretch w speed {speed_factor} Avg BA: {current_average_BA:.2f}% - Avg Visqol: {current_average_visqol:.2f}")
+                for tau_probs in [ 0.1]:
+                    detection_fraction = detection_probs(total_probs, tau_probs)
+                    print(f'TPR for AudioSeal (Tau_probs={tau_probs}): {detection_fraction:.3f}\n')
 
-                tau_ba = 0.83
-                detection_fraction = detection_BA(total_ba, tau_ba)
-                print(f'TPR for Timbre (Tau_ber={tau_ba}): {detection_fraction:.3f}\n')
+                for tau_ba in [0.81]:
+                    detection_fraction = detection_BA(total_ba, tau_ba)
+                    print(f'TPR for AudioSeal-B (Tau_ber={tau_ba}): {detection_fraction:.3f}\n')
 
     elif common_perturbation in ["gaussian_noise", "background_noise"]:
-        snr_values = [40, 30, 20, 10, 5]  # Example SNR values in dB
+        snr_values = [40,30, 20,10, 5]  # Example SNR values in dB
         for snr in snr_values:
             total_ba = []
+            total_probs = []
             total_visqol_scores = []
             total_counts = 0
-            output_dir_pert = f'log_timbre_audiomark_max_5s/common_pert_{common_perturbation}_snr_{snr}'
+            output_dir_pert = f'log_audioseal_audiomarkdata_max_5s/common_pert_{common_perturbation}_snr_{snr}'
             os.makedirs(output_dir_pert, exist_ok=True)
             file_list = [file for file in os.listdir(output_dir) if file.endswith('.wav')]
             progress_bar = tqdm(enumerate(file_list), desc=f"Applying {common_perturbation}")
@@ -338,14 +326,15 @@ def decode_audio_files_perturb(model, output_dir, common_perturbation, args):
             original_msgs = []
             path_list = []
             visqol = api_visqol()
-            output_txt_dir = f'txt_audiomark_Timbre/no_box_attack'
+            output_txt_dir = f'txt_audiomarkdata_AudioSeal/no_box_attack'
             os.makedirs(output_txt_dir, exist_ok=True)
             if common_perturbation == "gaussian_noise":
                 output_file = os.path.join(output_txt_dir, f"gaussian_noise_snr_{snr}.txt")
             elif common_perturbation == "background_noise":
                 output_file = os.path.join(output_txt_dir, f"background_noise_snr_{snr}.txt")
+
             with open(output_file, 'w') as txt_file:
-                txt_file.write("Path, Timbre BA, SNR, Visqol score\n")
+                txt_file.write("Path, AudioSeal-B BA, AudioSeal Dection Ratio, SNR, Visqol score\n")
                 for id, file in progress_bar:
                     try:
                         index_str, payload_str = file.rstrip('.wav').split('_')[-3:-1]
@@ -372,22 +361,35 @@ def decode_audio_files_perturb(model, output_dir, common_perturbation, args):
                     
                     waveform_pert = waveform_pert.unsqueeze(0).to(device=next(model.parameters()).device)
                     batch_watermarked_signals.append(waveform_pert)
-                    
+
                     if args.save_pert:
                         torchaudio.save(os.path.join(output_dir_pert, file), waveform_pert.squeeze(0).detach().cpu(), sample_rate)
+
 
                     # Extract original payload from filename for BER calculation
                     if len(batch_watermarked_signals) == args.batch_size or id == len(file_list) - 1:
                         batch_watermarked_signals = torch.cat(batch_watermarked_signals, dim=0)
                         original_msgs = torch.stack(original_msgs)
 
-                        bw_acc = get_bitacc(model, batch_watermarked_signals, original_msgs)
+                        with torch.no_grad():
+                            results, msgs_decoded = detector.detect_watermark(batch_watermarked_signals)
+                            detect_probs = get_detection_probability(detector, batch_watermarked_signals)
 
                         for i in range(len(batch_watermarked_signals)):
-                            total_ba.append(bw_acc[i].item())
+                            correct = (original_msgs[i] == msgs_decoded[i]).sum().item()
+                            msg_len = 16  # 16 bits
+                            BA = correct / msg_len
+                            detection_probability = detect_probs[i]
+                            total_ba.append(BA)
+                            total_probs.append(detection_probability)
                             total_visqol_scores.append(batch_visqol_scores[i])
                             total_counts += 1
-                            txt_file.write(f"{path_list[i]}, {bw_acc[i].item()}, {batch_SNRs[i]:.2f}, {batch_visqol_scores[i]}\n")
+                            txt_file.write(f"{path_list[i]}, {BA:.2f}, {detection_probability:.2f}, {batch_SNRs[i]:.2f}, {batch_visqol_scores[i]}\n")
+
+                        current_average_BA = (sum(total_ba) / total_counts) * 100
+                        current_average_dect_prob = (sum(total_probs) / total_counts) * 100
+                        current_average_visqol = sum(total_visqol_scores) / total_counts
+                        progress_bar.set_description(f"{common_perturbation} w SNR {snr} - Avg BA: {current_average_BA:.2f}%, Avg Det: {current_average_dect_prob:.2f}, Avg Visqol: {current_average_visqol:.2f}")
 
                         # Reset the batch
                         batch_watermarked_signals = []
@@ -396,24 +398,22 @@ def decode_audio_files_perturb(model, output_dir, common_perturbation, args):
                         original_msgs = []
                         path_list = []
 
-                        current_average_BA = (sum(total_ba) / total_counts) * 100
-                        current_average_visqol = sum(total_visqol_scores) / total_counts
-                        progress_bar.set_description(f"{common_perturbation} w SNR {snr} - Avg BA: {current_average_BA:.2f}% - Avg Visqol: {current_average_visqol:.2f}")
+                for tau_probs in [ 0.1]:
+                    detection_fraction = detection_probs(total_probs, tau_probs)
+                    print(f'TPR for AudioSeal (Tau_probs={tau_probs}): {detection_fraction:.3f}\n')
 
-                tau_ba = 0.83
-                detection_fraction = detection_BA(total_ba, tau_ba)
-                print(f'TPR for Timbre (Tau_ber={tau_ba}): {detection_fraction:.3f}\n')
+                for tau_ba in [0.81]:
+                    detection_fraction = detection_BA(total_ba, tau_ba)
+                    print(f'TPR for AudioSeal-B (Tau_ber={tau_ba}): {detection_fraction:.3f}\n')
 
     elif common_perturbation in ["soundstream"]:
-        # n_q_values =  [4, 6, 8, 12, 16]  
-        n_q_values =  [16]  
-
+        n_q_values =  [4, 6, 8, 12, 16]  
         for nq in n_q_values:
             total_ba = []
             total_probs = []
             total_visqol_scores = []
             total_counts = 0
-            output_dir_pert = f'log_timbre_audiomark_max_5s/common_pert_{common_perturbation}_nq_{nq}'
+            output_dir_pert = f'log_audioseal_audiomarkdata_max_5s/common_pert_{common_perturbation}_nq_{nq}'
             os.makedirs(output_dir_pert, exist_ok=True)
             file_list = [file for file in os.listdir(output_dir) if file.endswith('.wav')]
             progress_bar = tqdm(enumerate(file_list), desc=f"Applying {common_perturbation}")
@@ -424,7 +424,7 @@ def decode_audio_files_perturb(model, output_dir, common_perturbation, args):
             original_msgs = []
             path_list = []
             visqol = api_visqol()
-            output_txt_dir = f'txt_audiomark_Timbre/no_box_attack'
+            output_txt_dir = f'txt_audiomarkdata_AudioSeal/no_box_attack'
             os.makedirs(output_txt_dir, exist_ok=True)
             output_file = os.path.join(output_txt_dir, f"soundstream_nq_{nq}.txt")
 
@@ -451,21 +451,32 @@ def decode_audio_files_perturb(model, output_dir, common_perturbation, args):
                     batch_visqol_scores.append(score.moslqo)
                     waveform_pert = torch.tensor(waveform_pert.unsqueeze(0)).to(device=next(model.parameters()).device)
                     batch_watermarked_signals.append(waveform_pert)
-
                     if args.save_pert:
-                        torchaudio.save(os.path.join(output_dir_pert, file), waveform_pert.squeeze(0).detach().cpu(), sample_rate)
+                        torchaudio.save(os.path.join(output_dir_pert, file), torch.tensor(waveform_pert), new_sample_rate)
                     # Extract original payload from filename for BER calculation
                     if len(batch_watermarked_signals) == args.batch_size or id == len(file_list) - 1:
                         batch_watermarked_signals = torch.cat(batch_watermarked_signals, dim=0)
                         original_msgs = torch.stack(original_msgs)
 
-                        bw_acc = get_bitacc(model, batch_watermarked_signals, original_msgs)
+                        with torch.no_grad():
+                            results, msgs_decoded = detector.detect_watermark(batch_watermarked_signals)
+                            detect_probs = get_detection_probability(detector, batch_watermarked_signals)
 
                         for i in range(len(batch_watermarked_signals)):
-                            total_ba.append(bw_acc[i].item())
+                            correct = (original_msgs[i] == msgs_decoded[i]).sum().item()
+                            msg_len = 16  # 16 bits
+                            BA = correct / msg_len
+                            detection_probability = detect_probs[i]
+                            total_ba.append(BA)
+                            total_probs.append(detection_probability)
                             total_visqol_scores.append(batch_visqol_scores[i])
                             total_counts += 1
-                            txt_file.write(f"{path_list[i]}, {bw_acc[i].item()}, {batch_SNRs[i]:.2f}, {batch_visqol_scores[i]}\n")
+                            txt_file.write(f"{path_list[i]}, {BA:.2f}, {detection_probability:.2f}, {batch_SNRs[i]:.2f}, {batch_visqol_scores[i]}\n")
+
+                        current_average_BA = (sum(total_ba) / total_counts) * 100
+                        current_average_dect_prob = (sum(total_probs) / total_counts) * 100
+                        current_average_visqol = sum(total_visqol_scores) / total_counts
+                        progress_bar.set_description(f"{common_perturbation} w nq {nq} - Avg BA: {current_average_BA:.2f}%, Avg Det: {current_average_dect_prob:.2f}, Avg Visqol: {current_average_visqol:.2f}")
 
                         # Reset the batch
                         batch_watermarked_signals = []
@@ -474,21 +485,22 @@ def decode_audio_files_perturb(model, output_dir, common_perturbation, args):
                         original_msgs = []
                         path_list = []
 
-                        current_average_BA = (sum(total_ba) / total_counts) * 100
-                        current_average_visqol = sum(total_visqol_scores) / total_counts
-                        progress_bar.set_description(f"{common_perturbation} w nq {nq} Avg BA: {current_average_BA:.2f}% - Avg Visqol: {current_average_visqol:.2f}")
+                for tau_probs in [ 0.1]:
+                    detection_fraction = detection_probs(total_probs, tau_probs)
+                    print(f'TPR for AudioSeal (Tau_probs={tau_probs}): {detection_fraction:.3f}\n')
 
-                tau_ba = 0.83
-                detection_fraction = detection_BA(total_ba, tau_ba)
-                print(f'TPR for Timbre (Tau_ber={tau_ba}): {detection_fraction:.3f}\n')
+                for tau_ba in [0.81]:
+                    detection_fraction = detection_BA(total_ba, tau_ba)
+                    print(f'TPR for AudioSeal-B (Tau_ber={tau_ba}): {detection_fraction:.3f}\n')
 
     elif common_perturbation in ["opus"]:
         bitrate_list = [1, 2, 4, 8 ,16, 31]
         for bitrate in bitrate_list:
             total_ba = []
+            total_probs = []
             total_visqol_scores = []
             total_counts = 0
-            output_dir_pert = f'log_timbre_audiomark_max_5s/common_pert_{common_perturbation}_bitrate_{bitrate*16}k'
+            output_dir_pert = f'log_audioseal_audiomarkdata_max_5s/common_pert_{common_perturbation}_bitrate_{bitrate*16}k'
             os.makedirs(output_dir_pert, exist_ok=True)
             file_list = [file for file in os.listdir(output_dir) if file.endswith('.wav')]
             progress_bar = tqdm(enumerate(file_list), desc=f"Applying {common_perturbation}")
@@ -499,12 +511,12 @@ def decode_audio_files_perturb(model, output_dir, common_perturbation, args):
             original_msgs = []
             path_list = []
             visqol = api_visqol()
-            output_txt_dir = f'txt_audiomark_Timbre/no_box_attack'
+            output_txt_dir = f'txt_audiomarkdata_AudioSeal/no_box_attack'
             os.makedirs(output_txt_dir, exist_ok=True)
             output_file = os.path.join(output_txt_dir, f"{common_perturbation}_bitrate_{bitrate}.txt")
 
             with open(output_file, 'w') as txt_file:
-                txt_file.write("Path, Timbre BA, SNR, Visqol score\n")
+                txt_file.write("Path, AudioSeal-B BA, AudioSeal Dection Ratio, SNR, Visqol score\n")
                 for id, file in progress_bar:
                     try:
                         index_str, payload_str = file.rstrip('.wav').split('_')[-3:-1]
@@ -530,19 +542,31 @@ def decode_audio_files_perturb(model, output_dir, common_perturbation, args):
 
                     if args.save_pert:
                         torchaudio.save(os.path.join(output_dir_pert, file), waveform_pert.squeeze(0).detach().cpu(), sample_rate)
-                    
+
                     # Extract original payload from filename for BER calculation
                     if len(batch_watermarked_signals) == args.batch_size or id == len(file_list) - 1:
                         batch_watermarked_signals = torch.cat(batch_watermarked_signals, dim=0)
                         original_msgs = torch.stack(original_msgs)
 
-                        bw_acc = get_bitacc(model, batch_watermarked_signals, original_msgs)
+                        with torch.no_grad():
+                            results, msgs_decoded = detector.detect_watermark(batch_watermarked_signals)
+                            detect_probs = get_detection_probability(detector, batch_watermarked_signals)
 
                         for i in range(len(batch_watermarked_signals)):
-                            total_ba.append(bw_acc[i].item())
+                            correct = (original_msgs[i] == msgs_decoded[i]).sum().item()
+                            msg_len = 16  # 16 bits
+                            BA = correct / msg_len
+                            detection_probability = detect_probs[i]
+                            total_ba.append(BA)
+                            total_probs.append(detection_probability)
                             total_visqol_scores.append(batch_visqol_scores[i])
                             total_counts += 1
-                            txt_file.write(f"{path_list[i]}, {bw_acc[i].item()}, {batch_SNRs[i]:.2f}, {batch_visqol_scores[i]}\n")
+                            txt_file.write(f"{path_list[i]}, {BA:.2f}, {detection_probability:.2f}, {batch_SNRs[i]:.2f}, {batch_visqol_scores[i]}\n")
+
+                        current_average_BA = (sum(total_ba) / total_counts) * 100
+                        current_average_dect_prob = (sum(total_probs) / total_counts) * 100
+                        current_average_visqol = sum(total_visqol_scores) / total_counts
+                        progress_bar.set_description(f"{common_perturbation} w bitrate {bitrate*16}k - Avg BA: {current_average_BA:.2f}%, Avg Det: {current_average_dect_prob:.2f}, Avg Visqol: {current_average_visqol:.2f}")
 
                         # Reset the batch
                         batch_watermarked_signals = []
@@ -551,15 +575,15 @@ def decode_audio_files_perturb(model, output_dir, common_perturbation, args):
                         original_msgs = []
                         path_list = []
 
-                        current_average_BA = (sum(total_ba) / total_counts) * 100
-                        current_average_visqol = sum(total_visqol_scores) / total_counts
-                        progress_bar.set_description(f"{common_perturbation} w bitrate {bitrate*16}k Avg BA: {current_average_BA:.2f}% - Avg Visqol: {current_average_visqol:.2f}")
+                for tau_probs in [ 0.1]:
+                    detection_fraction = detection_probs(total_probs, tau_probs)
+                    print(f'TPR for AudioSeal (Tau_probs={tau_probs}): {detection_fraction:.3f}\n')
 
                 for tau_ba in [0.81]:
                     detection_fraction = detection_BA(total_ba, tau_ba)
-                    print(f'TPR for Timbre (Tau_ber={tau_ba}): {detection_fraction:.3f}\n')
+                    print(f'TPR for AudioSeal-B (Tau_ber={tau_ba}): {detection_fraction:.3f}\n')
 
-    elif common_perturbation in ["encodec"]:  # Changed from "opus" to "encodec"
+    elif common_perturbation in ["encodec"]: 
         from transformers import EncodecModel, AutoProcessor
         import warnings
         warnings.filterwarnings("ignore", message=".*Could not find image processor class.*feature_extractor_type.*")
@@ -567,11 +591,15 @@ def decode_audio_files_perturb(model, output_dir, common_perturbation, args):
         model_encodec = EncodecModel.from_pretrained("facebook/encodec_24khz")
         processor_encodec = AutoProcessor.from_pretrained("facebook/encodec_24khz")
         bandwidth_values = [1.5, 3.0, 6.0, 12.0, 24.0]
+
+
+        # bandwidth_values = [24.0]
         for bandwidth in bandwidth_values:
             total_ba = []
+            total_probs = []
             total_visqol_scores = []
             total_counts = 0
-            output_dir_pert = f'log_timbre_audiomark_max_5s/common_pert_{common_perturbation}_bandwidth_{bandwidth}'
+            output_dir_pert = f'log_audioseal_audiomarkdata_max_5s/common_pert_{common_perturbation}_bandwidth_{bandwidth}'
             os.makedirs(output_dir_pert, exist_ok=True)
             encodec_cache = os.path.join(output_dir_pert, 'perturbed')
             os.makedirs(encodec_cache, exist_ok=True)
@@ -583,7 +611,7 @@ def decode_audio_files_perturb(model, output_dir, common_perturbation, args):
             batch_SNRs = []
             original_msgs = []
             path_list = []
-            output_txt_dir = f'txt_audiomark_Timbre/no_box_attack'
+            output_txt_dir = f'txt_audiomarkdata_AudioSeal/no_box_attack'
             os.makedirs(output_txt_dir, exist_ok=True)
             output_file = os.path.join(output_txt_dir, f"{common_perturbation}_bandwidth_{bandwidth}.txt")
 
@@ -604,7 +632,7 @@ def decode_audio_files_perturb(model, output_dir, common_perturbation, args):
             visqol_scores = np.load(os.path.join(encodec_cache, 'scores.npy'), allow_pickle=True).item()
 
             with open(output_file, 'w') as txt_file:
-                txt_file.write("Path, Timbre BA, SNR, Visqol score\n")
+                txt_file.write("Path, AudioSeal-B BA, AudioSeal Dection Ratio, SNR, Visqol score\n")
                 file_list = [file for file in os.listdir(output_dir) if file.endswith('.wav')]
                 progress_bar = tqdm(enumerate(file_list), desc=f"Applying {common_perturbation}")
                 for id, file in progress_bar:
@@ -628,19 +656,31 @@ def decode_audio_files_perturb(model, output_dir, common_perturbation, args):
                     waveform_pert = waveform_pert.unsqueeze(0).to(device=next(model.parameters()).device)
                     batch_watermarked_signals.append(waveform_pert)
                     batch_visqol_scores.append(visqol_scores[file])
-                    
+
                     # Extract original payload from filename for BER calculation
                     if len(batch_watermarked_signals) == args.batch_size or id == len(file_list) - 1:
                         batch_watermarked_signals = torch.cat(batch_watermarked_signals, dim=0)
                         original_msgs = torch.stack(original_msgs)
 
-                        bw_acc = get_bitacc(model, batch_watermarked_signals, original_msgs)
+                        with torch.no_grad():
+                            results, msgs_decoded = detector.detect_watermark(batch_watermarked_signals)
+                            detect_probs = get_detection_probability(detector, batch_watermarked_signals)
 
                         for i in range(len(batch_watermarked_signals)):
-                            total_ba.append(bw_acc[i].item())
+                            correct = (original_msgs[i] == msgs_decoded[i]).sum().item()
+                            msg_len = 16  # 16 bits
+                            BA = correct / msg_len
+                            detection_probability = detect_probs[i]
+                            total_ba.append(BA)
+                            total_probs.append(detection_probability)
                             total_visqol_scores.append(batch_visqol_scores[i])
                             total_counts += 1
-                            txt_file.write(f"{path_list[i]}, {bw_acc[i].item()}, {batch_SNRs[i]:.2f}, {batch_visqol_scores[i]}\n")
+                            txt_file.write(f"{path_list[i]}, {BA:.2f}, {detection_probability:.2f}, {batch_SNRs[i]:.2f}, {batch_visqol_scores[i]}\n")
+
+                        current_average_BA = (sum(total_ba) / total_counts) * 100
+                        current_average_dect_prob = (sum(total_probs) / total_counts) * 100
+                        current_average_visqol = sum(total_visqol_scores) / total_counts
+                        progress_bar.set_description(f"{common_perturbation} w bandwidth {bandwidth} - Avg BA: {current_average_BA:.2f}%, Avg Det: {current_average_dect_prob:.2f}, Avg Visqol: {current_average_visqol:.2f}")
 
                         # Reset the batch
                         batch_watermarked_signals = []
@@ -649,22 +689,23 @@ def decode_audio_files_perturb(model, output_dir, common_perturbation, args):
                         original_msgs = []
                         path_list = []
 
-                        current_average_BA = (sum(total_ba) / total_counts) * 100
-                        current_average_visqol = sum(total_visqol_scores) / total_counts
-                        progress_bar.set_description(f"{common_perturbation} w bandwidth {bandwidth} Avg BA: {current_average_BA:.2f}% - Avg Visqol: {current_average_visqol:.2f}")
+                for tau_probs in [ 0.1]:
+                    detection_fraction = detection_probs(total_probs, tau_probs)
+                    print(f'TPR for AudioSeal (Tau_probs={tau_probs}): {detection_fraction:.3f}\n')
 
                 for tau_ba in [0.81]:
                     detection_fraction = detection_BA(total_ba, tau_ba)
-                    print(f'TPR for Timbre (Tau_ber={tau_ba}): {detection_fraction:.3f}\n')
+                    print(f'TPR for AudioSeal-B (Tau_ber={tau_ba}): {detection_fraction:.3f}\n')
 
     elif common_perturbation in ["quantization"]:  
         import math
         quantization_levels = [2**2, 2**3, 2**4, 2**5, 2**6]
         for quantization_bit in quantization_levels:
             total_ba = []
+            total_probs = []
             total_visqol_scores = []
             total_counts = 0
-            output_dir_pert = f'log_timbre_audiomark_max_5s/common_pert_{common_perturbation}_quantization_bit_{quantization_bit}'
+            output_dir_pert = f'log_audioseal_audiomarkdata_max_5s/common_pert_{common_perturbation}_quantization_bit_{quantization_bit}'
             os.makedirs(output_dir_pert, exist_ok=True)
             file_list = [file for file in os.listdir(output_dir) if file.endswith('.wav')]
             progress_bar = tqdm(enumerate(file_list), desc=f"Applying {common_perturbation}")
@@ -675,12 +716,12 @@ def decode_audio_files_perturb(model, output_dir, common_perturbation, args):
             original_msgs = []
             path_list = []
             visqol = api_visqol()
-            output_txt_dir = f'txt_audiomark_Timbre/no_box_attack'
+            output_txt_dir = f'txt_audiomarkdata_AudioSeal/no_box_attack'
             os.makedirs(output_txt_dir, exist_ok=True)
             output_file = os.path.join(output_txt_dir, f"{common_perturbation}_quantization_bit_{quantization_bit}.txt")
 
             with open(output_file, 'w') as txt_file:
-                txt_file.write("Path, Timbre BA, SNR, Visqol score\n")
+                txt_file.write("Path, AudioSeal-B BA, AudioSeal Dection Ratio, SNR, Visqol score\n")
                 for id, file in progress_bar:
                     try:
                         index_str, payload_str = file.rstrip('.wav').split('_')[-3:-1]
@@ -697,7 +738,7 @@ def decode_audio_files_perturb(model, output_dir, common_perturbation, args):
                     waveform, sample_rate = torchaudio.load(path)
                     waveform_pert = pert_quantization(waveform,quantization_bit) 
                     snr = compute_snr(waveform.squeeze().unsqueeze(0),waveform_pert)
-                    batch_SNRs.append(snr)
+                    batch_SNRs.append(snr)  
                     # Compute Visqol score
                     score = visqol.Measure(np.array(waveform.squeeze(), dtype=np.float64), np.array(waveform_pert.squeeze(), dtype=np.float64))
                     batch_visqol_scores.append(score.moslqo)
@@ -705,16 +746,32 @@ def decode_audio_files_perturb(model, output_dir, common_perturbation, args):
                     batch_watermarked_signals.append(waveform_pert)
                     if args.save_pert:
                         torchaudio.save(os.path.join(output_dir_pert, file), waveform_pert.squeeze(0).detach().cpu(), sample_rate)
+
                     # Extract original payload from filename for BER calculation
                     if len(batch_watermarked_signals) == args.batch_size or id == len(file_list) - 1:
                         batch_watermarked_signals = torch.cat(batch_watermarked_signals, dim=0)
                         original_msgs = torch.stack(original_msgs)
-                        bw_acc = get_bitacc(model, batch_watermarked_signals, original_msgs)
+
+                        with torch.no_grad():
+                            results, msgs_decoded = detector.detect_watermark(batch_watermarked_signals)
+                            detect_probs = get_detection_probability(detector, batch_watermarked_signals)
+
                         for i in range(len(batch_watermarked_signals)):
-                            total_ba.append(bw_acc[i].item())
+                            correct = (original_msgs[i] == msgs_decoded[i]).sum().item()
+                            msg_len = 16  # 16 bits
+                            BA = correct / msg_len
+                            detection_probability = detect_probs[i]
+                            total_ba.append(BA)
+                            total_probs.append(detection_probability)
                             total_visqol_scores.append(batch_visqol_scores[i])
                             total_counts += 1
-                            txt_file.write(f"{path_list[i]}, {bw_acc[i].item()}, {batch_SNRs[i]:.2f}, {batch_visqol_scores[i]}\n")
+                            txt_file.write(f"{path_list[i]}, {BA:.2f}, {detection_probability:.2f}, {batch_SNRs[i]:.2f}, {batch_visqol_scores[i]}\n")
+
+                        current_average_BA = (sum(total_ba) / total_counts) * 100
+                        current_average_dect_prob = (sum(total_probs) / total_counts) * 100
+                        current_average_visqol = sum(total_visqol_scores) / total_counts
+                        progress_bar.set_description(f"{common_perturbation} w quantization_bit {quantization_bit} - Avg BA: {current_average_BA:.2f}%, Avg Det: {current_average_dect_prob:.2f}, Avg Visqol: {current_average_visqol:.2f}")
+
                         # Reset the batch
                         batch_watermarked_signals = []
                         batch_visqol_scores = []
@@ -722,21 +779,22 @@ def decode_audio_files_perturb(model, output_dir, common_perturbation, args):
                         original_msgs = []
                         path_list = []
 
-                        current_average_BA = (sum(total_ba) / total_counts) * 100
-                        current_average_visqol = sum(total_visqol_scores) / total_counts
-                        progress_bar.set_description(f"{common_perturbation} w quantization_bit {quantization_bit} Avg BA: {current_average_BA:.2f}% - Avg Visqol: {current_average_visqol:.2f}")
+                for tau_probs in [ 0.1]:
+                    detection_fraction = detection_probs(total_probs, tau_probs)
+                    print(f'TPR for AudioSeal (Tau_probs={tau_probs}): {detection_fraction:.3f}\n')
 
-                tau_ba = 0.83
-                detection_fraction = detection_BA(total_ba, tau_ba)
-                print(f'TPR for Timbre (Tau_ber={tau_ba}): {detection_fraction:.3f}\n')
+                for tau_ba in [0.81]:
+                    detection_fraction = detection_BA(total_ba, tau_ba)
+                    print(f'TPR for AudioSeal-B (Tau_ber={tau_ba}): {detection_fraction:.3f}\n')
 
     elif common_perturbation in ["highpass", "lowpass"]:
         ratio_list = [0.1, 0.2, 0.3, 0.4, 0.5]
         for ratio in ratio_list:
             total_ba = []
+            total_probs = []
             total_visqol_scores = []
             total_counts = 0
-            output_dir_pert = f'log_timbre_audiomark_max_5s/common_pert_{common_perturbation}_ratio_{ratio}'
+            output_dir_pert = f'log_audioseal_audiomarkdata_max_5s/common_pert_{common_perturbation}_ratio_{ratio}'
             os.makedirs(output_dir_pert, exist_ok=True)
             file_list = [file for file in os.listdir(output_dir) if file.endswith('.wav')]
             progress_bar = tqdm(enumerate(file_list), desc=f"Applying {common_perturbation}")
@@ -747,12 +805,12 @@ def decode_audio_files_perturb(model, output_dir, common_perturbation, args):
             original_msgs = []
             path_list = []
             visqol = api_visqol()
-            output_txt_dir = f'txt_audiomark_Timbre/no_box_attack'
+            output_txt_dir = f'txt_audiomarkdata_AudioSeal/no_box_attack'
             os.makedirs(output_txt_dir, exist_ok=True)
             output_file = os.path.join(output_txt_dir, f"{common_perturbation}_ratio_{ratio}.txt")
 
             with open(output_file, 'w') as txt_file:
-                txt_file.write("Path, Timbre BA, SNR, Visqol score\n")
+                txt_file.write("Path, AudioSeal-B BA, AudioSeal Dection Ratio, SNR, Visqol score\n")
                 for id, file in progress_bar:
                     try:
                         index_str, payload_str = file.rstrip('.wav').split('_')[-3:-1]
@@ -771,6 +829,7 @@ def decode_audio_files_perturb(model, output_dir, common_perturbation, args):
                         waveform_pert = pert_highpass(waveform,ratio,sample_rate) 
                     elif common_perturbation == 'lowpass':
                         waveform_pert = pert_lowpass(waveform,ratio,sample_rate) 
+                    
                     snr = compute_snr(waveform.squeeze().unsqueeze(0),waveform_pert)
                     batch_SNRs.append(snr)
                     # Compute Visqol score
@@ -781,16 +840,32 @@ def decode_audio_files_perturb(model, output_dir, common_perturbation, args):
 
                     if args.save_pert:
                         torchaudio.save(os.path.join(output_dir_pert, file), waveform_pert.squeeze(0).detach().cpu(), sample_rate)
+
                     # Extract original payload from filename for BER calculation
                     if len(batch_watermarked_signals) == args.batch_size or id == len(file_list) - 1:
                         batch_watermarked_signals = torch.cat(batch_watermarked_signals, dim=0)
                         original_msgs = torch.stack(original_msgs)
-                        bw_acc = get_bitacc(model, batch_watermarked_signals, original_msgs)
+
+                        with torch.no_grad():
+                            results, msgs_decoded = detector.detect_watermark(batch_watermarked_signals)
+                            detect_probs = get_detection_probability(detector, batch_watermarked_signals)
+
                         for i in range(len(batch_watermarked_signals)):
-                            total_ba.append(bw_acc[i].item())
+                            correct = (original_msgs[i] == msgs_decoded[i]).sum().item()
+                            msg_len = 16  # 16 bits
+                            BA = correct / msg_len
+                            detection_probability = detect_probs[i]
+                            total_ba.append(BA)
+                            total_probs.append(detection_probability)
                             total_visqol_scores.append(batch_visqol_scores[i])
                             total_counts += 1
-                            txt_file.write(f"{path_list[i]}, {bw_acc[i].item()}, {batch_SNRs[i]:.2f}, {batch_visqol_scores[i]}\n")
+                            txt_file.write(f"{path_list[i]}, {BA:.2f}, {detection_probability:.2f}, {batch_SNRs[i]:.2f}, {batch_visqol_scores[i]}\n")
+
+                        current_average_BA = (sum(total_ba) / total_counts) * 100
+                        current_average_dect_prob = (sum(total_probs) / total_counts) * 100
+                        current_average_visqol = sum(total_visqol_scores) / total_counts
+                        progress_bar.set_description(f"{common_perturbation} w ratio {ratio} - Avg BA: {current_average_BA:.2f}%, Avg Det: {current_average_dect_prob:.2f}, Avg Visqol: {current_average_visqol:.2f}")
+
                         # Reset the batch
                         batch_watermarked_signals = []
                         batch_visqol_scores = []
@@ -798,20 +873,22 @@ def decode_audio_files_perturb(model, output_dir, common_perturbation, args):
                         original_msgs = []
                         path_list = []
 
-                        current_average_BA = (sum(total_ba) / total_counts) * 100
-                        current_average_visqol = sum(total_visqol_scores) / total_counts
-                        progress_bar.set_description(f"{common_perturbation} w ratio {ratio} Avg BA: {current_average_BA:.2f}% - Avg Visqol: {current_average_visqol:.2f}")
-                tau_ba = 0.83
-                detection_fraction = detection_BA(total_ba, tau_ba)
-                print(f'TPR for Timbre (Tau_ber={tau_ba}): {detection_fraction:.3f}\n')
+                for tau_probs in [ 0.1]:
+                    detection_fraction = detection_probs(total_probs, tau_probs)
+                    print(f'TPR for AudioSeal (Tau_probs={tau_probs}): {detection_fraction:.3f}\n')
+
+                for tau_ba in [0.81]:
+                    detection_fraction = detection_BA(total_ba, tau_ba)
+                    print(f'TPR for AudioSeal-B (Tau_ber={tau_ba}): {detection_fraction:.3f}\n')
 
     elif common_perturbation in ["smooth"]:
         window_list = [6, 10, 14, 18, 22]
         for window_size in window_list:
             total_ba = []
+            total_probs = []
             total_visqol_scores = []
             total_counts = 0
-            output_dir_pert = f'log_timbre_audiomark_max_5s/common_pert_{common_perturbation}_window_size_{window_size}'
+            output_dir_pert = f'log_audioseal_audiomarkdata_max_5s/common_pert_{common_perturbation}_window_size_{window_size}'
             os.makedirs(output_dir_pert, exist_ok=True)
             file_list = [file for file in os.listdir(output_dir) if file.endswith('.wav')]
             progress_bar = tqdm(enumerate(file_list), desc=f"Applying {common_perturbation}")
@@ -822,12 +899,12 @@ def decode_audio_files_perturb(model, output_dir, common_perturbation, args):
             original_msgs = []
             path_list = []
             visqol = api_visqol()
-            output_txt_dir = f'txt_audiomark_Timbre/no_box_attack'
+            output_txt_dir = f'txt_audiomarkdata_AudioSeal/no_box_attack'
             os.makedirs(output_txt_dir, exist_ok=True)
             output_file = os.path.join(output_txt_dir, f"{common_perturbation}_window_size_{window_size}.txt")
 
             with open(output_file, 'w') as txt_file:
-                txt_file.write("Path, Timbre BA, SNR, Visqol score\n")
+                txt_file.write("Path, AudioSeal-B BA, AudioSeal Dection Ratio, SNR, Visqol score\n")
                 for id, file in progress_bar:
                     try:
                         index_str, payload_str = file.rstrip('.wav').split('_')[-3:-1]
@@ -850,18 +927,34 @@ def decode_audio_files_perturb(model, output_dir, common_perturbation, args):
                     batch_visqol_scores.append(score.moslqo)
                     waveform_pert = waveform_pert.unsqueeze(0).to(device=next(model.parameters()).device)
                     batch_watermarked_signals.append(waveform_pert)
+
                     if args.save_pert:
-                        torchaudio.save(os.path.join(output_dir_pert, file), waveform_pert.squeeze(0).detach().cpu(), sample_rate)
+                        torchaudio.save(os.path.join(output_dir_pert, file), waveform_pert.squeeze(0).cpu().detach(), sample_rate)
                     # Extract original payload from filename for BER calculation
                     if len(batch_watermarked_signals) == args.batch_size or id == len(file_list) - 1:
                         batch_watermarked_signals = torch.cat(batch_watermarked_signals, dim=0)
                         original_msgs = torch.stack(original_msgs)
-                        bw_acc = get_bitacc(model, batch_watermarked_signals, original_msgs)
+
+                        with torch.no_grad():
+                            results, msgs_decoded = detector.detect_watermark(batch_watermarked_signals)
+                            detect_probs = get_detection_probability(detector, batch_watermarked_signals)
+
                         for i in range(len(batch_watermarked_signals)):
-                            total_ba.append(bw_acc[i].item())
+                            correct = (original_msgs[i] == msgs_decoded[i]).sum().item()
+                            msg_len = 16  # 16 bits
+                            BA = correct / msg_len
+                            detection_probability = detect_probs[i]
+                            total_ba.append(BA)
+                            total_probs.append(detection_probability)
                             total_visqol_scores.append(batch_visqol_scores[i])
                             total_counts += 1
-                            txt_file.write(f"{path_list[i]}, {bw_acc[i].item()}, {batch_SNRs[i]:.2f}, {batch_visqol_scores[i]}\n")
+                            txt_file.write(f"{path_list[i]}, {BA:.2f}, {detection_probability:.2f}, {batch_SNRs[i]:.2f}, {batch_visqol_scores[i]}\n")
+
+                        current_average_BA = (sum(total_ba) / total_counts) * 100
+                        current_average_dect_prob = (sum(total_probs) / total_counts) * 100
+                        current_average_visqol = sum(total_visqol_scores) / total_counts
+                        progress_bar.set_description(f"{common_perturbation} w window size {window_size} - Avg BA: {current_average_BA:.2f}%, Avg Det: {current_average_dect_prob:.2f}, Avg Visqol: {current_average_visqol:.2f}")
+
                         # Reset the batch
                         batch_watermarked_signals = []
                         batch_visqol_scores = []
@@ -869,21 +962,22 @@ def decode_audio_files_perturb(model, output_dir, common_perturbation, args):
                         original_msgs = []
                         path_list = []
 
-                        current_average_BA = (sum(total_ba) / total_counts) * 100
-                        current_average_visqol = sum(total_visqol_scores) / total_counts
-                        progress_bar.set_description(f"{common_perturbation} w window size {window_size} Avg BA: {current_average_BA:.2f}% - Avg Visqol: {current_average_visqol:.2f}")
+                for tau_probs in [ 0.1]:
+                    detection_fraction = detection_probs(total_probs, tau_probs)
+                    print(f'TPR for AudioSeal (Tau_probs={tau_probs}): {detection_fraction:.3f}\n')
 
-                tau_ba = 0.83
-                detection_fraction = detection_BA(total_ba, tau_ba)
-                print(f'TPR for Timbre (Tau_ber={tau_ba}): {detection_fraction:.3f}\n')
+                for tau_ba in [0.81]:
+                    detection_fraction = detection_BA(total_ba, tau_ba)
+                    print(f'TPR for AudioSeal-B (Tau_ber={tau_ba}): {detection_fraction:.3f}\n')
 
     elif common_perturbation in ["echo"]:
         decay_list = [0.1, 0.3, 0.5, 0.7, 0.9]
         for decay in decay_list:
             total_ba = []
-            total_visqol_scores = []            
+            total_probs = []
+            total_visqol_scores = []
             total_counts = 0
-            output_dir_pert = f'log_timbre_audiomark_max_5s/common_pert_{common_perturbation}_decay{decay}'
+            output_dir_pert = f'log_audioseal_audiomarkdata_max_5s/common_pert_{common_perturbation}_decay{decay}'
             os.makedirs(output_dir_pert, exist_ok=True)
             file_list = [file for file in os.listdir(output_dir) if file.endswith('.wav')]
             progress_bar = tqdm(enumerate(file_list), desc=f"Applying {common_perturbation}")
@@ -894,12 +988,12 @@ def decode_audio_files_perturb(model, output_dir, common_perturbation, args):
             original_msgs = []
             path_list = []
             visqol = api_visqol()
-            output_txt_dir = f'txt_audiomark_Timbre/no_box_attack'
+            output_txt_dir = f'txt_audiomarkdata_AudioSeal/no_box_attack'
             os.makedirs(output_txt_dir, exist_ok=True)
             output_file = os.path.join(output_txt_dir, f"{common_perturbation}_decay_{decay}.txt")
 
             with open(output_file, 'w') as txt_file:
-                txt_file.write("Path, Timbre BA, SNR, Visqol score\n")
+                txt_file.write("Path, AudioSeal-B BA, AudioSeal Dection Ratio, SNR, Visqol score\n")
                 for id, file in progress_bar:
                     try:
                         index_str, payload_str = file.rstrip('.wav').split('_')[-3:-1]
@@ -923,17 +1017,33 @@ def decode_audio_files_perturb(model, output_dir, common_perturbation, args):
                     waveform_pert = waveform_pert.unsqueeze(0).to(device=next(model.parameters()).device)
                     batch_watermarked_signals.append(waveform_pert)
                     if args.save_pert:
-                        torchaudio.save(os.path.join(output_dir_pert, file), waveform_pert.squeeze(0).detach().cpu(), sample_rate)
+                        torchaudio.save(os.path.join(output_dir_pert, file), waveform_pert.squeeze(0).cpu().detach(), sample_rate)
+
                     # Extract original payload from filename for BER calculation
                     if len(batch_watermarked_signals) == args.batch_size or id == len(file_list) - 1:
                         batch_watermarked_signals = torch.cat(batch_watermarked_signals, dim=0)
                         original_msgs = torch.stack(original_msgs)
-                        bw_acc = get_bitacc(model, batch_watermarked_signals, original_msgs)
+
+                        with torch.no_grad():
+                            results, msgs_decoded = detector.detect_watermark(batch_watermarked_signals)
+                            detect_probs = get_detection_probability(detector, batch_watermarked_signals)
+
                         for i in range(len(batch_watermarked_signals)):
-                            total_ba.append(bw_acc[i].item())
+                            correct = (original_msgs[i] == msgs_decoded[i]).sum().item()
+                            msg_len = 16  # 16 bits
+                            BA = correct / msg_len
+                            detection_probability = detect_probs[i]
+                            total_ba.append(BA)
+                            total_probs.append(detection_probability)
                             total_visqol_scores.append(batch_visqol_scores[i])
                             total_counts += 1
-                            txt_file.write(f"{path_list[i]}, {bw_acc[i].item()}, {batch_SNRs[i]:.2f}, {batch_visqol_scores[i]}\n")
+                            txt_file.write(f"{path_list[i]}, {BA:.2f}, {detection_probability:.2f}, {batch_SNRs[i]:.2f}, {batch_visqol_scores[i]}\n")
+
+                        current_average_BA = (sum(total_ba) / total_counts) * 100
+                        current_average_dect_prob = (sum(total_probs) / total_counts) * 100
+                        current_average_visqol = sum(total_visqol_scores) / total_counts
+                        progress_bar.set_description(f"{common_perturbation} decay {decay}s - Avg BA: {current_average_BA:.2f}%, Avg Det: {current_average_dect_prob:.2f}, Avg Visqol: {current_average_visqol:.2f}")
+
                         # Reset the batch
                         batch_watermarked_signals = []
                         batch_visqol_scores = []
@@ -941,21 +1051,23 @@ def decode_audio_files_perturb(model, output_dir, common_perturbation, args):
                         original_msgs = []
                         path_list = []
 
-                        current_average_BA = (sum(total_ba) / total_counts) * 100
-                        current_average_visqol = sum(total_visqol_scores) / total_counts
-                        progress_bar.set_description(f"{common_perturbation} decay {decay}s Avg BA: {current_average_BA:.2f}% - Avg Visqol: {current_average_visqol:.2f}")
+                for tau_probs in [ 0.1]:
+                    detection_fraction = detection_probs(total_probs, tau_probs)
+                    print(f'TPR for AudioSeal (Tau_probs={tau_probs}): {detection_fraction:.3f}\n')
 
-                tau_ba = 0.83
-                detection_fraction = detection_BA(total_ba, tau_ba)
-                print(f'TPR for Timbre (Tau_ber={tau_ba}): {detection_fraction:.3f}\n')
+                for tau_ba in [0.81]:
+                    detection_fraction = detection_BA(total_ba, tau_ba)
+                    print(f'TPR for AudioSeal-B (Tau_ber={tau_ba}): {detection_fraction:.3f}\n')
 
     elif common_perturbation in ["mp3"]:
         bitrate_list = [8, 16, 24, 32, 40]
         for bitrate in bitrate_list:
             total_ba = []
+            total_probs = []
+            total_SNRs = []
             total_visqol_scores = []
             total_counts = 0
-            output_dir_pert = f'log_timbre_audiomark_max_5s/common_pert_{common_perturbation}_bitrate_{bitrate}'
+            output_dir_pert = f'log_audioseal_audiomarkdata_max_5s/common_pert_{common_perturbation}_bitrate_{bitrate}'
             os.makedirs(output_dir_pert, exist_ok=True)
             file_list = [file for file in os.listdir(output_dir) if file.endswith('.wav')]
             progress_bar = tqdm(enumerate(file_list), desc=f"Applying {common_perturbation}")
@@ -966,12 +1078,12 @@ def decode_audio_files_perturb(model, output_dir, common_perturbation, args):
             original_msgs = []
             path_list = []
             visqol = api_visqol()
-            output_txt_dir = f'txt_audiomark_Timbre/no_box_attack'
+            output_txt_dir = f'txt_audiomarkdata_AudioSeal/no_box_attack'
             os.makedirs(output_txt_dir, exist_ok=True)
             output_file = os.path.join(output_txt_dir, f"{common_perturbation}_bitrate_{bitrate}.txt")
 
             with open(output_file, 'w') as txt_file:
-                txt_file.write("Path, Timbre BA, SNR, Visqol score\n")
+                txt_file.write("Path, AudioSeal-B BA, AudioSeal Dection Ratio, SNR, Visqol score\n")
                 for id, file in progress_bar:
                     try:
                         index_str, payload_str = file.rstrip('.wav').split('_')[-3:-1]
@@ -995,17 +1107,34 @@ def decode_audio_files_perturb(model, output_dir, common_perturbation, args):
                     waveform_pert = waveform_pert.unsqueeze(0).to(device=next(model.parameters()).device)
                     batch_watermarked_signals.append(waveform_pert)
                     if args.save_pert:
-                        torchaudio.save(os.path.join(output_dir_pert, file), waveform_pert.squeeze(0).detach().cpu(), sample_rate)              
+                        torchaudio.save(os.path.join(output_dir_pert, file), waveform_pert.squeeze(0).cpu().detach(), sample_rate)
+
                     # Extract original payload from filename for BER calculation
                     if len(batch_watermarked_signals) == args.batch_size or id == len(file_list) - 1:
                         batch_watermarked_signals = torch.cat(batch_watermarked_signals, dim=0)
                         original_msgs = torch.stack(original_msgs)
-                        bw_acc = get_bitacc(model, batch_watermarked_signals, original_msgs)
+
+                        with torch.no_grad():
+                            results, msgs_decoded = detector.detect_watermark(batch_watermarked_signals)
+                            detect_probs = get_detection_probability(detector, batch_watermarked_signals)
+
                         for i in range(len(batch_watermarked_signals)):
-                            total_ba.append(bw_acc[i].item())
+                            correct = (original_msgs[i] == msgs_decoded[i]).sum().item()
+                            msg_len = 16  # 16 bits
+                            BA = correct / msg_len
+                            detection_probability = detect_probs[i]
+                            total_ba.append(BA)
+                            total_probs.append(detection_probability)
                             total_visqol_scores.append(batch_visqol_scores[i])
+                            total_SNRs.append(batch_SNRs[i])
                             total_counts += 1
-                            txt_file.write(f"{path_list[i]}, {bw_acc[i].item()}, {batch_SNRs[i]:.2f}, {batch_visqol_scores[i]}\n")
+                            txt_file.write(f"{path_list[i]}, {BA:.2f}, {detection_probability:.2f}, {batch_SNRs[i]:.2f}, {batch_visqol_scores[i]}\n")
+
+                        current_average_BA = (sum(total_ba) / total_counts) * 100
+                        current_average_dect_prob = (sum(total_probs) / total_counts) * 100
+                        current_average_visqol = sum(total_visqol_scores) / total_counts
+                        progress_bar.set_description(f"{common_perturbation} w bitrate {bitrate} - Avg BA: {current_average_BA:.2f}%, Avg Det: {current_average_dect_prob:.2f}, Avg Visqol: {current_average_visqol:.2f}")
+
                         # Reset the batch
                         batch_watermarked_signals = []
                         batch_visqol_scores = []
@@ -1013,14 +1142,13 @@ def decode_audio_files_perturb(model, output_dir, common_perturbation, args):
                         original_msgs = []
                         path_list = []
 
-                        current_average_BA = (sum(total_ba) / total_counts) * 100
-                        current_average_visqol = sum(total_visqol_scores) / total_counts
-                        progress_bar.set_description(f"{common_perturbation} w bitrate {bitrate} Avg BA: {current_average_BA:.2f}% - Avg Visqol: {current_average_visqol:.2f}")
+                for tau_probs in [ 0.1]:
+                    detection_fraction = detection_probs(total_probs, tau_probs)
+                    print(f'TPR for AudioSeal (Tau_probs={tau_probs}): {detection_fraction:.3f}\n')
 
-                tau_ba = 0.83
-                detection_fraction = detection_BA(total_ba, tau_ba)
-                print(f'TPR for Timbre (Tau_ber={tau_ba}): {detection_fraction:.3f}\n')
-
+                for tau_ba in [0.81]:
+                    detection_fraction = detection_BA(total_ba, tau_ba)
+                    print(f'TPR for AudioSeal-B (Tau_ber={tau_ba}): {detection_fraction:.3f}\n')
     else: 
         raise NotImplementedError
 
@@ -1250,16 +1378,12 @@ def pert_echo(
     :return: Audio signal with reverb.
     """
     tensor = tensor.unsqueeze(0)
-    # Create a simple impulse response
-    # Duration of the impulse response in seconds
-    # duration = torch.FloatTensor(1).uniform_(*duration_range)
+
     duration = torch.Tensor([duration])
-    # volume = torch.FloatTensor(1).uniform_(*volume_range)
     volume = torch.Tensor([volume])
     n_samples = int(sample_rate * duration)
     impulse_response = torch.zeros(n_samples).type(tensor.type()).to(tensor.device)
 
-    # Define a few reflections with decreasing amplitude
     impulse_response[0] = 1.0  # Direct sound
 
     impulse_response[
@@ -1532,18 +1656,11 @@ class Mp3Compression(BaseWaveformTransform):
 def adjust_padding_ss_model(model):
     for name, module in model.named_children():
         if isinstance(module, torch.nn.Conv1d):
-            # Calculate the new padding value
-            # This formula assumes stride = 1 and dilation = 1 for simplicity
             new_padding = (module.kernel_size[0] - 1) // 2
-            # Set the new padding
-            # module.padding = (new_padding,)
             module.padding = 'valid'
         elif isinstance(module, torch.nn.ConvTranspose1d):
-            # You might also want to adjust padding for transposed convolutions if necessary
-            # module.padding = 'valid'
             pass
         else:
-            # Recursively adjust padding for child modules
             adjust_padding_ss_model(module)
 
 def main():
@@ -1556,44 +1673,22 @@ def main():
         device = torch.device(f'cuda:{args.gpu}')
     else:
         device = torch.device('cpu')
+    model = AudioSeal.load_generator("audioseal_wm_16bits").to(device)
 
-    import yaml
-    from timbre.model.conv2_mel_modules import Encoder, Decoder
-    process_config = yaml.load(open("timbre/config/process.yaml", "r"), Loader=yaml.FullLoader)
-
-    model_config = yaml.load(open("timbre/config/model.yaml", "r"), Loader=yaml.FullLoader)
-    train_config = yaml.load(open("timbre/config/train.yaml", "r"), Loader=yaml.FullLoader)
-    win_dim = process_config["audio"]["win_len"]
-    embedding_dim = model_config["dim"]["embedding"]
-    nlayers_encoder = model_config["layer"]["nlayers_encoder"]
-    nlayers_decoder = model_config["layer"]["nlayers_decoder"]
-    attention_heads_encoder = model_config["layer"]["attention_heads_encoder"]
-    attention_heads_decoder = model_config["layer"]["attention_heads_decoder"]
-    generator = Encoder(process_config, model_config, 30, win_dim, embedding_dim, nlayers_encoder=nlayers_encoder, attention_heads=attention_heads_encoder).to(device)
-    detector = Decoder(process_config, model_config, 30, win_dim, embedding_dim, nlayers_decoder=nlayers_decoder, attention_heads=attention_heads_decoder).to(device)
-    checkpoint = torch.load('timbre/results/ckpt/pth/compressed_none-conv2_ep_20_2023-02-14_02_24_57.pth.tar')
-    generator.load_state_dict(checkpoint['encoder'])
-    detector.load_state_dict(checkpoint['decoder'], strict=False)
-    generator.eval()
-    detector.eval()
-    # decoder.robust = False
-
-    data_dir = "audiomark/sample_20k" #NOTE: Change this to the path of the Common Voice dataset
+    data_dir = "audiomarkdata/sample_20k" #NOTE: Change this to the path of the Common Voice dataset
 
 
-    output_dir = f'audiomark_timbre_max_5s'
+    output_dir = f'audiomarkdata_audioseal_max_5s'
     dataset_dir = os.path.join(output_dir, 'watermarked')
     os.makedirs(output_dir, exist_ok=True)
     os.makedirs(dataset_dir, exist_ok=True)
 
     if args.encode:
-        models = [generator, detector]
-        encode_audio_files(models, data_dir, output_dir, args.max_length)
-
+        encode_audio_files(model, data_dir, output_dir, args.max_length)
     if args.common_perturbation != '':
-        decode_audio_files_perturb(detector, dataset_dir, args.common_perturbation, args)
+        decode_audio_files_perturb(model, dataset_dir, args.common_perturbation, args)
     else:
-        decode_audio_files(detector, dataset_dir, args.batch_size)
+        decode_audio_files(model, dataset_dir, args.batch_size)
 
 if __name__ == "__main__":
     main()

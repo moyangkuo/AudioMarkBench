@@ -32,7 +32,7 @@ def parse_arguments():
 
     parser.add_argument("--attack_bitstring", action="store_true", default=False, help="If set, perturb the bitstring instead of the detection probability")
     parser.add_argument("--model", type=str, default='audioseal', choices=['audioseal','wavmark', 'timbre'], help="Model to be attacked")
-    parser.add_argument("--dataset", type=str, default="audiomark", help="Dataset to use for the attack")
+    parser.add_argument("--dataset", type=str, default="audiomarkdata", help="Dataset to use for the attack")
 
     print("Arguments: ", parser.parse_args())
     return parser.parse_args()
@@ -192,7 +192,7 @@ def whitebox_attack(detector, watermarked_signal, args):
 
 
 def decode_audio_files_perturb_whitebox(model, output_dir, args, device):
-    if args.dataset == 'audiomark':
+    if args.dataset == 'audiomarkdata':
         watermarked_files = os.listdir(os.path.join(output_dir, 'watermarked_200'))
     else:
         watermarked_files = [f for f in os.listdir(os.path.join(output_dir,'watermarked'))]
@@ -242,11 +242,11 @@ def main():
 
     if args.model == 'audioseal':
         model = AudioSeal.load_detector("audioseal_detector_16bits").to(device=device)
-        output_dir = 'audiomark_audioseal_max_5s'if args.dataset == 'audiomark' else 'LibriSpeech_audioseal_max_5s'
+        output_dir = 'audiomarkdata_audioseal_max_5s'if args.dataset == 'audiomarkdata' else 'LibriSpeech_audioseal_max_5s'
         os.makedirs(output_dir, exist_ok=True)
     elif args.model == 'wavmark':
         model = wavmark.load_model().to(device)
-        output_dir = 'audiomark_wavmark_max_5s' if args.dataset == 'audiomark' else 'LibriSpeech_wavmark_max_5s'
+        output_dir = 'audiomarkdata_wavmark_max_5s' if args.dataset == 'audiomarkdata' else 'LibriSpeech_wavmark_max_5s'
         os.makedirs(output_dir, exist_ok=True)
     elif args.model == 'timbre':
         process_config = yaml.load(open("timbre/config/process.yaml", "r"), Loader=yaml.FullLoader)
@@ -261,7 +261,7 @@ def main():
         detector.load_state_dict(checkpoint['decoder'], strict=False)
         detector.eval()
         model = detector
-        output_dir = 'audiomark_timbre_max_5s' if args.dataset == 'audiomark' else 'LibriSpeech_timbre_max_5s'
+        output_dir = 'audiomarkdata_timbre_max_5s' if args.dataset == 'audiomarkdata' else 'LibriSpeech_timbre_max_5s'
         os.makedirs(output_dir, exist_ok=True)
 
     decode_audio_files_perturb_whitebox(model, output_dir, args, device)

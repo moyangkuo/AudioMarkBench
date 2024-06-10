@@ -32,7 +32,6 @@ def parse_arguments():
 
     parser.add_argument("--batch_size", type=int, default=1, help="Batch size for the attack")
     parser.add_argument("--tau", type=float, default=0, help="Threshold for the detector")
-    parser.add_argument("--snr", type=list, default=[0,2.5, 5,7.5,10,12.5,15,17.5,20,22.5,25,27.5,30], help="Signal-to-noise ratio for the attack")
     parser.add_argument("--norm", type=str, default='linf', help="Norm for the attack")
     parser.add_argument("--attack_bitstring", action="store_true", help="If set, perturb the bitstring instead of the detection probability")
     parser.add_argument("--model", type=str, default='', choices=['audioseal','wavmark', 'timbre'], help="Model to be attacked")

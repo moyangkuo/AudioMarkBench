@@ -438,7 +438,7 @@ class signal22spectrogram:
 
 def decode_audio_files_perturb_blackbox(model, output_dir, args, device):
     attack = square_attack_l2 if args.norm == 2 else square_attack_linf
-    watermarked_files = os.listdir(os.path.join(output_dir, 'watermarked_200')) # NOTE: this is the subsampled dataset of AudioMarkBench
+    watermarked_files = os.listdir(os.path.join(output_dir, 'watermarked_200')) # NOTE: this is the subsampled dataset of audiomarkdataBench
     progress_bar = tqdm(watermarked_files, desc="Decoding Watermarks under blackbox attack")
     save_path = os.path.join(output_dir, args.blackbox_folder)
     os.makedirs(save_path, exist_ok=True)   
@@ -494,11 +494,11 @@ def main():
 
     if args.model == 'audioseal':
         model = AudioSeal.load_detector("audioseal_detector_16bits").to(device=device)
-        output_dir = 'audiomark_audioseal_max_5s'
+        output_dir = 'audiomarkdata_audioseal_max_5s'
         os.makedirs(output_dir, exist_ok=True)
     elif args.model == 'wavmark':
         model = wavmark.load_model().to(device)
-        output_dir = 'audiomark_wavmark_max_5s'
+        output_dir = 'audiomarkdata_wavmark_max_5s'
         os.makedirs(output_dir, exist_ok=True)
     elif args.model == 'timbre':
         process_config = yaml.load(open("timbre/config/process.yaml", "r"), Loader=yaml.FullLoader)
@@ -512,7 +512,7 @@ def main():
         detector.load_state_dict(checkpoint['decoder'], strict=False)
         detector.eval()
         model = detector
-        output_dir = 'audiomark_timbre_max_5s'
+        output_dir = 'audiomarkdata_timbre_max_5s'
         os.makedirs(output_dir, exist_ok=True)
 
     decode_audio_files_perturb_blackbox(model, output_dir, args, device)
