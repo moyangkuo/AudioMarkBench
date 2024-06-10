@@ -3,20 +3,12 @@ import argparse
 import numpy as np
 import torch
 import torchaudio
-# import audioseal
 from audioseal import AudioSeal
-# import wavmark
 import wavmark
 from wavmark.utils import wm_add_util
-
-
-# import timbre
 import yaml
 from timbre.model.conv2_mel_modules import Decoder
-
-
 from tqdm import tqdm
-from art.estimators.classification import PyTorchClassifier
 import torch.optim as optim
 import torch.nn as nn
 import time
@@ -89,12 +81,10 @@ class WatermarkDetectorWrapper():
         loss = nn.CrossEntropyLoss()
         cross_entropy_loss = loss(messages.squeeze(), self.message)
         class_1_probs = results[:, 1, :]
-        penalty = torch.relu(0.1 - class_1_probs)
+        penalty = torch.relu(self.threshold - class_1_probs)
         total_penalty = torch.mean(penalty)
         return total_penalty + cross_entropy_loss
-        # return cross_entropy_loss
         
-    
     def loss_timbre(self, signal):
         payload = self.model.test_forward(signal) # signal: [1,1,80000]
         message = self.message * 2 - 1
@@ -130,7 +120,6 @@ class WatermarkDetectorWrapper():
         
     def bwacc_wavmark(self, signal):
         signal = signal.squeeze().detach().cpu()
-        # payload, info = wavmark.decode_watermark(self.model, signal)
         payload, info = wavmark.decode_watermark(self.model, signal)
 
         if payload is None:
@@ -209,7 +198,7 @@ def decode_audio_files_perturb_whitebox(model, output_dir, args, device):
     progress_bar = tqdm(enumerate(watermarked_files), desc="Decoding Watermarks under whitebox attack")
     save_path = os.path.join(output_dir, args.whitebox_folder)
     os.makedirs(save_path, exist_ok=True)   
-    # visqol = api_visqol()
+    visqol = api_visqol()
     for file_num, watermarked_file in progress_bar:
         idx = '_'.join(watermarked_file.split('_')[:-2]) # idx_bitstring_snr
         waveform, sample_rate = torchaudio.load(os.path.join(output_dir, 'watermarked_200', watermarked_file))

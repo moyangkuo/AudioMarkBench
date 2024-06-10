@@ -1374,16 +1374,11 @@ def pert_echo(
     :return: Audio signal with reverb.
     """
     tensor = tensor.unsqueeze(0)
-    # Create a simple impulse response
-    # Duration of the impulse response in seconds
-    # duration = torch.FloatTensor(1).uniform_(*duration_range)
     duration = torch.Tensor([duration])
-    # volume = torch.FloatTensor(1).uniform_(*volume_range)
     volume = torch.Tensor([volume])
     n_samples = int(sample_rate * duration)
     impulse_response = torch.zeros(n_samples).type(tensor.type()).to(tensor.device)
 
-    # Define a few reflections with decreasing amplitude
     impulse_response[0] = 1.0  # Direct sound
 
     impulse_response[

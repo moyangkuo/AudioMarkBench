@@ -1378,16 +1378,12 @@ def pert_echo(
     :return: Audio signal with reverb.
     """
     tensor = tensor.unsqueeze(0)
-    # Create a simple impulse response
-    # Duration of the impulse response in seconds
-    # duration = torch.FloatTensor(1).uniform_(*duration_range)
+
     duration = torch.Tensor([duration])
-    # volume = torch.FloatTensor(1).uniform_(*volume_range)
     volume = torch.Tensor([volume])
     n_samples = int(sample_rate * duration)
     impulse_response = torch.zeros(n_samples).type(tensor.type()).to(tensor.device)
 
-    # Define a few reflections with decreasing amplitude
     impulse_response[0] = 1.0  # Direct sound
 
     impulse_response[
@@ -1660,18 +1656,11 @@ class Mp3Compression(BaseWaveformTransform):
 def adjust_padding_ss_model(model):
     for name, module in model.named_children():
         if isinstance(module, torch.nn.Conv1d):
-            # Calculate the new padding value
-            # This formula assumes stride = 1 and dilation = 1 for simplicity
             new_padding = (module.kernel_size[0] - 1) // 2
-            # Set the new padding
-            # module.padding = (new_padding,)
             module.padding = 'valid'
         elif isinstance(module, torch.nn.ConvTranspose1d):
-            # You might also want to adjust padding for transposed convolutions if necessary
-            # module.padding = 'valid'
             pass
         else:
-            # Recursively adjust padding for child modules
             adjust_padding_ss_model(module)
 
 def main():

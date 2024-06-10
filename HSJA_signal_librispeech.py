@@ -112,7 +112,7 @@ class WatermarkDetectorWrapper(PyTorchClassifier):
             self.predict = self.predict_audioseal
             self.bwacc = self.bwacc_audioseal
 
-    def predict_audioseal(self, signal, batch_size=1):# signal is np.array
+    def predict_audioseal(self, signal, batch_size=1):
         signal = torch.tensor(signal, dtype=torch.float).to(self._device)
         result, msg_decoded = self.model.detect_watermark(signal.unsqueeze(0))
         if self.on_bitstring:
@@ -120,7 +120,7 @@ class WatermarkDetectorWrapper(PyTorchClassifier):
         else:
             return self.our_conversion_logic_binary(result)
 
-    def bwacc_audioseal(self, signal): #signal is tensor on gpu
+    def bwacc_audioseal(self, signal): 
         result, msg_decoded = self.model.detect_watermark(signal.unsqueeze(0))
         if self.on_bitstring:
             if msg_decoded is None:
@@ -132,12 +132,12 @@ class WatermarkDetectorWrapper(PyTorchClassifier):
         else:
             return result
         
-    def predict_wavmark(self, signal, batch_size=1): # signal is np.array
+    def predict_wavmark(self, signal, batch_size=1): 
         signal = torch.tensor(signal, dtype=torch.float).squeeze(0)
         payload, info = wavmark.decode_watermark(self.model, signal) # signal: [,80000]
         return self.our_conversion_logic(payload)
 
-    def bwacc_wavmark(self, signal):  #signal is tensor on gpu
+    def bwacc_wavmark(self, signal):  
         signal = signal.squeeze(0).detach().cpu()
         payload, info = wavmark.decode_watermark(self.model, signal) # signal: [,80000]
         if payload is None:
@@ -147,7 +147,7 @@ class WatermarkDetectorWrapper(PyTorchClassifier):
             bit_acc = 1-torch.sum(torch.abs(payload-self.message))/self.message.shape[0]
             return bit_acc.item()
         
-    def predict_timbre(self, signal, batch_size=1): # signal is np.array
+    def predict_timbre(self, signal, batch_size=1): 
         signal = torch.tensor(signal, dtype=torch.float).to(self._device)
         payload = self.model.test_forward(signal.unsqueeze(0)) # signal: [1,80000]
         message = self.message * 2 - 1
@@ -159,7 +159,7 @@ class WatermarkDetectorWrapper(PyTorchClassifier):
             class_idx = (bit_acc>=self.th)
         return np.array([[0,1]]) if class_idx else np.array([[1,0]])
 
-    def bwacc_timbre(self, signal):  #signal is tensor on gpu
+    def bwacc_timbre(self, signal):  
         payload = self.model.test_forward(signal.unsqueeze(0)) # signal: [1,1,80000]
         message = self.message * 2 - 1
         payload = payload.to(message.device)
@@ -169,7 +169,7 @@ class WatermarkDetectorWrapper(PyTorchClassifier):
           
     def our_conversion_logic(self, payload):
         if payload is None:
-            return np.array([[1,0]])# NOTE if result is None, then it is classified as 0, not detected
+            return np.array([[1,0]])
         else: 
             payload = torch.tensor(payload).to(self.message.device)
             bit_acc = 1-torch.sum(torch.abs(payload-self.message))/self.message.shape[0]
@@ -181,7 +181,7 @@ class WatermarkDetectorWrapper(PyTorchClassifier):
 
     def our_conversion_logic_binary(self, bit_acc):
         if bit_acc is None:
-            return np.array([[1,0]])# NOTE if result is None, then it is classified as 0, not detected
+            return np.array([[1,0]])
         else: 
             if self.detector_type=='double-tailed':
                 class_idx = torch.logical_or((bit_acc>=self.th), (bit_acc<=(1-self.th)))

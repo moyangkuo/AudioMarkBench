@@ -3,20 +3,12 @@ import argparse
 import numpy as np
 import torch
 import torchaudio
-# import audioseal
 from audioseal import AudioSeal
-# import wavmark
 import wavmark
 from wavmark.utils import wm_add_util
-
-
-# import timbre
 import yaml
 from timbre.model.conv2_mel_modules import Decoder
-
-
 from tqdm import tqdm
-from art.estimators.classification import PyTorchClassifier
 import torch.optim as optim
 import torch.nn as nn
 import time
@@ -133,7 +125,6 @@ class WatermarkDetectorWrapper():
         
     def bwacc_wavmark(self, signal):
         signal = signal.squeeze().detach().cpu()
-        # payload, info = wavmark.decode_watermark(self.model, signal)
         payload, info = wavmark.decode_watermark(self.model, signal)
 
         if payload is None:
@@ -177,13 +168,9 @@ def whitebox_attack(detector, watermarked_signal, args):
         optimizer.zero_grad()
         watermarked_signal_with_noise = watermarked_signal + tensor_pert 
         loss = detector.get_loss(watermarked_signal_with_noise)
-        # bwacc = detector.bwacc(watermarked_signal_with_noise)
-        # snr = 10*torch.log10(torch.mean(watermarked_signal**2)/torch.mean(tensor_pert**2))
-        # print(f'best BWACC: {best_bwacc:.3f}, BWACC: {bwacc:.3f}, SNR: {snr:.1f}')
         # Backpropagation
         loss.backward()
         optimizer.step()
-        # tensor_pert.data = torch.clamp(tensor_pert.data, -args.pert_boundary, args.pert_boundary)
         scale_factor = get_scale_factor(watermarked_signal, tensor_pert, args.rescale_snr)
         if scale_factor > 1:
             tensor_pert.data /= scale_factor
