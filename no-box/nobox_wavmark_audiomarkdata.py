@@ -814,7 +814,7 @@ def pert_opus(waveform: torch.tensor, bitrate: int, quality: int) -> None:
     waveform_scaled = waveform_scaled.reshape(-1,1).numpy()
     opuspy.write("temp.opus", waveform_scaled, sample_rate = 16000, 
                 bitrate = bitrate, signal_type = 0, encoder_complexity = quality)
-    pert_waveform, sampling_rate = opuspy.read("temp.opus") # NOTE that the sample rate is always 48000
+    pert_waveform, sampling_rate = opuspy.read("temp.opus") 
     os.remove("temp.opus")
     resampler = torchaudio.transforms.Resample(orig_freq=48000, new_freq=16000)
     pert_waveform = torch.tensor(pert_waveform, dtype=torch.float32).reshape(1,-1)

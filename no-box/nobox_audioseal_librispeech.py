@@ -1258,7 +1258,7 @@ def pert_opus(waveform: torch.tensor, bitrate: int, quality: int, cache: str) ->
     cache_file = os.path.join(cache, "temp.opus")
     opuspy.write(cache_file, waveform_scaled, sample_rate = 16000, 
                 bitrate = bitrate, signal_type = 0, encoder_complexity = quality)
-    pert_waveform, sampling_rate = opuspy.read(cache_file) # NOTE that the sample rate is always 48000
+    pert_waveform, sampling_rate = opuspy.read(cache_file) 
     os.remove(cache_file)
     resampler = torchaudio.transforms.Resample(orig_freq=48000, new_freq=16000)
     pert_waveform = torch.tensor(pert_waveform, dtype=torch.float32).reshape(1,-1)
@@ -1677,7 +1677,7 @@ def main():
         device = torch.device('cpu')
     model = AudioSeal.load_generator("audioseal_wm_16bits").to(device)
 
-    librispeech_dir = "LibriSpeech_dataset" # NOTE: Change this to the LibriSpeech dataset directory
+    librispeech_dir = "LibriSpeech_dataset" 
     librispeech_test = torchaudio.datasets.LIBRISPEECH(root=librispeech_dir, url="test-clean", download=True)
     indices = torch.randperm(len(librispeech_test)).tolist()
     selected_indices = indices[:args.testset_size]
