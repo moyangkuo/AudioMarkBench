@@ -1,0 +1,9 @@
+[submodule "audioseal"]
+	path = audioseal
+	url = https://github.com/facebookresearch/audioseal
+[submodule "wavmark"]
+	path = wavmark
+	url = https://github.com/wavmark/wavmark
+[submodule "TimbreWatermarking"]
+	path = TimbreWatermarking
+	url = https://github.com/TimbreWatermarking/TimbreWatermarking
